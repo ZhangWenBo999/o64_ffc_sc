@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.fft
 
 from saicinpainting.training.modules.base import get_activation, BaseDiscriminator
 from saicinpainting.training.modules.spatial_transform import LearnableSpatialTransformWrapper
