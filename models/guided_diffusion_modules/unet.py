@@ -5,6 +5,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from saicinpainting.training.modules.base import get_activation, BaseDiscriminator
+from saicinpainting.training.modules.spatial_transform import LearnableSpatialTransformWrapper
+from saicinpainting.training.modules.squeeze_excitation import SELayer
+from saicinpainting.utils import get_shape
+from saicinpainting.training.modules.ffc import *
+
 from .nn import (
     checkpoint,
     zero_module,
@@ -237,9 +248,18 @@ class AttentionBlock(nn.Module):
             self.attention = QKVAttentionLegacy(self.num_heads)
 
         self.proj_out = zero_module(nn.Conv1d(channels, channels, 1))
-
+        self.tuple_flag = 0
     def forward(self, x):
-        return checkpoint(self._forward, (x,), self.parameters(), True)
+        if type(x) is tuple:
+            x = torch.cat(x, 1)
+            self.tuple_flag = 1
+        out = checkpoint(self._forward, (x,), self.parameters(), True)
+        if self.tuple_flag == 1:
+            self.tuple_flag = 0
+            out1 = out[:, :256]
+            out2 = out[:, 256:]
+            out = (out1, out2)
+        return out
 
     def _forward(self, x):
         b, c, *spatial = x.shape
@@ -361,6 +381,13 @@ class UNet(nn.Module):
         use_scale_shift_norm=True,
         resblock_updown=True,
         use_new_attention_order=False,
+
+        ngf=64, n_blocks=3, norm_layer=nn.BatchNorm2d,
+        padding_type='reflect', activation_layer=nn.ReLU,
+        downsample_conv_kwargs={"ratio_gin": 0, "ratio_gout": 0.75, "enable_lfu": False}, resnet_conv_kwargs={"ratio_gin": 0.75, "ratio_gout": 0.75, "enable_lfu": False},
+        spatial_transform_layers=None, spatial_transform_kwargs={},
+        add_out_act=True, max_features=1024, out_ffc=False, out_ffc_kwargs={},
+        up_norm_layer = nn.BatchNorm2d, up_activation = nn.ReLU(True)
     ):
 
         super().__init__()
@@ -447,7 +474,7 @@ class UNet(nn.Module):
                 ds *= 2
                 self._feature_size += ch
 
-        self.middle_block = EmbedSequential(
+        self.middle_block_origin = EmbedSequential(
             ResBlock(
                 ch,
                 cond_embed_dim,
@@ -471,6 +498,39 @@ class UNet(nn.Module):
             ),
         )
         self._feature_size += ch
+
+        mode_fcc = []
+
+        cur_conv_kwargs = downsample_conv_kwargs
+        mode_fcc += [FFC_BN_ACT(512,
+                             1024,
+                             kernel_size=3, stride=2, padding=1,
+                             norm_layer=norm_layer,
+                             activation_layer=activation_layer,
+                             **cur_conv_kwargs)]
+
+        ### resnet blocks
+        for i in range(n_blocks):
+            cur_resblock = FFCResnetBlock(1024, padding_type=padding_type, activation_layer=activation_layer,
+                                          norm_layer=norm_layer, **resnet_conv_kwargs)
+            if spatial_transform_layers is not None and i in spatial_transform_layers:
+                cur_resblock = LearnableSpatialTransformWrapper(cur_resblock, **spatial_transform_kwargs)
+            mode_fcc += [cur_resblock]
+            mode_fcc += [AttentionBlock(
+                1024,
+                use_checkpoint=use_checkpoint,
+                num_heads=num_heads,
+                num_head_channels=num_head_channels,
+                use_new_attention_order=use_new_attention_order,
+            )]
+        mode_fcc += [ConcatTupleLayer()]
+
+        mode_fcc += [nn.ConvTranspose2d(1024, 512,
+                                     kernel_size=3, stride=2, padding=1, output_padding=1),
+                  up_norm_layer(512),
+                  up_activation]
+
+        self.mode_fcc = nn.Sequential(*mode_fcc)
 
         self.output_blocks = nn.ModuleList([])
         for level, mult in list(enumerate(channel_mults))[::-1]:
@@ -521,6 +581,11 @@ class UNet(nn.Module):
             SiLU(),
             zero_module(nn.Conv2d(input_ch, out_channel, 3, padding=1)),
         )
+        self.out_ffc = nn.Sequential(
+            normalization(1024),
+            SiLU(),
+            zero_module(nn.Conv2d(1024, 512, 3, padding=1)),
+        )
     def forward(self, x, gammas):
         """
         Apply the model to an input batch.
@@ -536,12 +601,20 @@ class UNet(nn.Module):
         for module in self.input_blocks:
             h = module(h, emb)
             hs.append(h)
-        h = self.middle_block(h, emb)
+        h_origin = h
+        h_ffc = h
+
+        h_origin = self.middle_block_origin(h_origin, emb)
+        h_ffc = self.mode_fcc(h_ffc)
+
+        h_hybrid = torch.cat((h_origin, h_ffc), dim=1)
+        h_hybrid = self.out_ffc(h_hybrid)
+
         for module in self.output_blocks:
-            h = torch.cat([h, hs.pop()], dim=1)
-            h = module(h, emb)
-        h = h.type(x.dtype)
-        return self.out(h)
+            h_hybrid = torch.cat([h_hybrid, hs.pop()], dim=1)
+            h_hybrid = module(h_hybrid, emb)
+        h_hybrid = h_hybrid.type(x.dtype)
+        return self.out(h_hybrid)
 
 if __name__ == '__main__':
     b, c, h, w = 3, 6, 64, 64
