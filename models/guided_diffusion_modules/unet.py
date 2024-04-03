@@ -586,6 +586,7 @@ class UNet(nn.Module):
             SiLU(),
             zero_module(nn.Conv2d(1024, 512, 3, padding=1)),
         )
+        self.skip_connection_sc = nn.Conv2d(6, 3, 1)
     def forward(self, x, gammas):
         """
         Apply the model to an input batch.
@@ -614,7 +615,7 @@ class UNet(nn.Module):
             h_hybrid = torch.cat([h_hybrid, hs.pop()], dim=1)
             h_hybrid = module(h_hybrid, emb)
         h_hybrid = h_hybrid.type(x.dtype)
-        return self.out(h_hybrid)
+        return self.out(h_hybrid) + self.skip_connection_sc(x)
 
 if __name__ == '__main__':
     b, c, h, w = 3, 6, 64, 64
